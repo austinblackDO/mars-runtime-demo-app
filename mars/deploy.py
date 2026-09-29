@@ -103,6 +103,9 @@ def preflight():
     missing = [k for k in REQUIRED if not os.environ.get(k, "").strip()]
     if missing:
         raise Stop("DID-NOT-RUN", f"env not set: {', '.join(missing)}")
+    placeholders = [k for k in ("DO_API_TOKEN", "MODEL_ACCESS_KEY") if os.environ[k].strip().startswith("REPLACE-WITH-")]
+    if placeholders:
+        raise Stop("DID-NOT-RUN", f"still the stub placeholder, not a real value: {', '.join(placeholders)}")
     for seam, val in (("DO_API_BASE", DO_API), ("INFERENCE_BASE", INFER), ("GITHUB_API_BASE", GH_API)):
         if os.environ.get(seam):
             phase("preflight", "note", f"TEST SEAM {seam}={val}")
