@@ -18,6 +18,7 @@ Env (secrets are read here and never printed):
   DEMO_APP_NAME      default mars-demo-app · DEMO_REGION default nyc
   DEMO_DEADLINE_S    default 420 (the 8-min stage budget minus margin) · DEMO_POLL_S default 5
   DEMO_DB_WAIT_S     default 60: how long preflight waits for the cluster to read `online`
+  DEMO_EDGE_IPS      default 172.66.0.96,162.159.140.98 (see EDGE_IPS)
 Test seams (printed on every run when set): DO_API_BASE, INFERENCE_BASE, GITHUB_API_BASE.
 
 Output grammar (one line each, machine-readable; the only prose is the one-line reason):
@@ -26,17 +27,25 @@ Output grammar (one line each, machine-readable; the only prose is the one-line 
   RESULT {"kind": "mars-demo.result", ...}
 Exit: 0 PASS · 1 FAIL · 2 DID-NOT-RUN · 64 usage.
 """
+import http.client as httpclient  # aliased: this module defines its own http()
 import json
 import os
+import socket
+import ssl
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 T0 = time.monotonic()
 DO_API = os.environ.get("DO_API_BASE", "https://api.digitalocean.com").rstrip("/")
 INFER = os.environ.get("INFERENCE_BASE", "https://inference.do-ai.run").rstrip("/")
 GH_API = os.environ.get("GITHUB_API_BASE", "https://api.github.com").rstrip("/")
+# App Platform's shared Cloudflare edge for *.ondigitalocean.app (every app on the team resolved to these,
+# measured 2026-09-29; an unknown host through them answers 530, a routed one 200). Connecting here with the app's
+# hostname as SNI never asks DNS about the NEW name, whose NXDOMAIN the zone lets resolvers cache for 1800 s.
+EDGE_IPS = [x.strip() for x in os.environ.get("DEMO_EDGE_IPS", "172.66.0.96,162.159.140.98").split(",") if x.strip()]
 REQUIRED = ("DO_API_TOKEN", "MODEL_ACCESS_KEY", "DEMO_APP_REPO", "DEMO_APP_MODEL", "DEMO_DB_CLUSTER")
 TERMINAL_BAD = {"ERROR", "CANCELED", "SUPERSEDED"}
 
@@ -82,6 +91,34 @@ def http(method, url, token=None, body=None, timeout=30):
         raw, status = e.read(), e.code
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         return 0, f"{type(e).__name__}: {e}"
+    try:
+        return status, json.loads(raw or b"null")
+    except ValueError:
+        return status, raw.decode(errors="replace")[:300]
+
+
+def http_via(url, ip, timeout=30):
+    """GET url by connecting to `ip` while TLS-verifying and routing on the URL's own hostname (curl --resolve)."""
+    u = urllib.parse.urlsplit(url)
+    host, port = u.hostname, u.port or (443 if u.scheme == "https" else 80)
+    path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+    ctx = ssl.create_default_context()
+
+    class Conn(httpclient.HTTPSConnection if u.scheme == "https" else httpclient.HTTPConnection):
+        def connect(self):
+            sock = socket.create_connection((ip, port), timeout)
+            self.sock = ctx.wrap_socket(sock, server_hostname=host) if u.scheme == "https" else sock
+
+    kw = {"context": ctx} if u.scheme == "https" else {}
+    c = Conn(host, port, timeout=timeout, **kw)
+    try:
+        c.request("GET", path, headers={"Host": u.netloc, "Accept": "application/json", "User-Agent": "mars-demo-deploy/1"})
+        r = c.getresponse()
+        raw, status = r.read(), r.status
+    except (OSError, httpclient.HTTPException) as e:
+        return 0, f"{type(e).__name__}: {e}"
+    finally:
+        c.close()
     try:
         return status, json.loads(raw or b"null")
     except ValueError:
@@ -256,14 +293,22 @@ def prove(app_id, pf, deadline):
     url = (d.get("app") or {}).get("live_url") if s == 200 else None
     if not url:
         raise Stop("FAIL", api_error("app has no live_url after ACTIVE", s, d), app_id=app_id)
-    # the first resolve happens only now, after ACTIVE: the sandbox resolver caches NXDOMAIN for 1800 s
     phase("proof", "start", url)
-    last = "no attempt"
+    last, n = "no attempt", 0
+    # edge IPs first, round-robin; plain DNS only from the 7th attempt on, as a fallback for an edge that moved —
+    # by then the name has usually existed long enough that the lookup cannot cache a fresh NXDOMAIN
+    routes = [("edge", ip) for ip in EDGE_IPS]
     while True:
-        s, body = http("GET", url.rstrip("/") + "/proof", timeout=45)
+        route = routes[n % len(routes)] if routes and n < 6 else ("dns", None)
+        if route[0] == "edge":
+            s, body = http_via(url.rstrip("/") + "/proof", route[1], timeout=45)
+        else:
+            s, body = http("GET", url.rstrip("/") + "/proof", timeout=45)
+        n += 1
         if isinstance(body, dict) and body.get("kind") == "mars-demo.proof":
             db, inf = body.get("db") or {}, body.get("inference") or {}
-            phase("proof", body.get("verdict", "?"), f"db={db.get('roundtrip')} inference={inf.get('roundtrip')}")
+            phase("proof", body.get("verdict", "?"),
+                  f"db={db.get('roundtrip')} inference={inf.get('roundtrip')} via {route[0]}{' ' + route[1] if route[1] else ''}")
             if body.get("verdict") == "PASS" and db.get("roundtrip") == "ok" and inf.get("roundtrip") == "ok":
                 if body.get("commit") not in (None, pf["sha"]):
                     raise Stop("FAIL", f"/proof reports commit {body['commit']}, expected {pf['sha'][:12]}")
@@ -271,7 +316,7 @@ def prove(app_id, pf, deadline):
             parts = [f"db {db.get('roundtrip')}: {db.get('detail')}" if db.get("roundtrip") != "ok" else "",
                      f"inference {inf.get('roundtrip')}: {inf.get('detail')}" if inf.get("roundtrip") != "ok" else ""]
             raise Stop("FAIL", "/proof " + "; ".join(p for p in parts if p), url=url, proof=body)
-        last = f"HTTP {s} {str(body)[:120]}"
+        last = f"via {route[0]}{' ' + route[1] if route[1] else ''}: HTTP {s} {str(body)[:100]}"
         if time.monotonic() > deadline:
             raise Stop("FAIL", f"/proof never answered in budget (last: {last})", url=url)
         phase("proof", "retry", last)
