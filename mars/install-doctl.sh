@@ -12,7 +12,7 @@ case "$(uname -m)" in
   *) echo "install-doctl: REFUSED — unsupported arch $(uname -m)" >&2; exit 2 ;;
 esac
 DEST="$HOME/.local/bin"
-if [ -x "$DEST/doctl" ] && "$DEST/doctl" version 2>/dev/null | grep -q "doctl version $VER"; then
+if [ -x "$DEST/doctl" ] && grep -q "doctl version $VER" <<<"$("$DEST/doctl" version 2>/dev/null)"; then
   echo "install-doctl: doctl $VER already installed at $DEST/doctl"; exit 0
 fi
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
