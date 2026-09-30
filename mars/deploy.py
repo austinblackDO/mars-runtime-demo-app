@@ -294,14 +294,21 @@ def prove(app_id, pf, deadline):
     if not url:
         raise Stop("FAIL", api_error("app has no live_url after ACTIVE", s, d), app_id=app_id)
     phase("proof", "start", url)
-    last, n = "no attempt", 0
-    # edge IPs first, round-robin; plain DNS only from the 7th attempt on, as a fallback for an edge that moved —
-    # by then the name has usually existed long enough that the lookup cannot cache a fresh NXDOMAIN
+    last, n, edge_unreachable = "no attempt", 0, 0
+    # Edge IPs, round-robin, for the whole budget. Two causes, two paths (laptop run 2): HTTP 530 = the edge is up but
+    # its route to the new app is not live yet → keep waiting ON THE EDGE (a DNS lookup now could cache NXDOMAIN for
+    # 1800 s); a CONNECTION failure = this sandbox cannot reach the edge IPs at all → only then fall back to DNS.
     routes = [("edge", ip) for ip in EDGE_IPS]
+    use_dns = not routes
     while True:
-        route = routes[n % len(routes)] if routes and n < 6 else ("dns", None)
+        route = ("dns", None) if use_dns else routes[n % len(routes)]
         if route[0] == "edge":
             s, body = http_via(url.rstrip("/") + "/proof", route[1], timeout=45)
+            if s == 0:
+                edge_unreachable += 1
+                if edge_unreachable >= 2 * len(routes):
+                    use_dns = True
+                    phase("proof", "note", "edge IPs unreachable from here (connection errors) — falling back to DNS")
         else:
             s, body = http("GET", url.rstrip("/") + "/proof", timeout=45)
         n += 1
@@ -316,7 +323,8 @@ def prove(app_id, pf, deadline):
             parts = [f"db {db.get('roundtrip')}: {db.get('detail')}" if db.get("roundtrip") != "ok" else "",
                      f"inference {inf.get('roundtrip')}: {inf.get('detail')}" if inf.get("roundtrip") != "ok" else ""]
             raise Stop("FAIL", "/proof " + "; ".join(p for p in parts if p), url=url, proof=body)
-        last = f"via {route[0]}{' ' + route[1] if route[1] else ''}: HTTP {s} {str(body)[:100]}"
+        snippet = "HTML page" if isinstance(body, str) and body.lstrip().startswith("<") else " ".join(str(body).split())[:100]
+        last = f"via {route[0]}{' ' + route[1] if route[1] else ''}: HTTP {s} {snippet}"  # one line: the agent narrates these
         if time.monotonic() > deadline:
             raise Stop("FAIL", f"/proof never answered in budget (last: {last})", url=url)
         phase("proof", "retry", last)
